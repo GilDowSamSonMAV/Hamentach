@@ -1,0 +1,1 @@
+streamlit\nollama\nopenai\npydantic\npython-dotenv
