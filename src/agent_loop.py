@@ -12,16 +12,87 @@ from .config import OLLAMA_MODEL, MAX_TOOL_CALLS_PER_TURN
 logger = logging.getLogger(__name__)
 
 
+def _try_parse_json(raw: str) -> dict | None:
+    """Attempt several JSON repairs until json.loads succeeds.
+
+    Repairs tried in order:
+    1. Raw string as-is
+    2. Strip escaped single quotes (\\' -> ')
+    3. Replace single-quote delimiters with double quotes
+    4. Both repairs combined
+    """
+    candidates = [
+        raw,
+        raw.replace("\\'", "'"),
+        raw.replace("'", '"'),
+        raw.replace("\\'", "'").replace("'", '"'),
+    ]
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _extract_balanced_json(text: str) -> dict | None:
+    """Find the first balanced JSON object via brace counting.
+
+    Unlike a simple regex this handles:
+    - Arbitrarily nested objects/arrays
+    - Escaped single quotes inside string values
+    - Unclosed braces (auto-adds one closing brace as fallback)
+    - Trailing garbage after the closing brace
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return _try_parse_json(text[start : i + 1])
+
+    # Unclosed object — try adding one closing brace
+    return _try_parse_json(text[start:] + "}")
+
+
 def extract_json(text: str) -> dict | None:
-    """Extract a JSON object from LLM output, handling markdown fences and prose."""
-    # Try direct parse first
+    """Extract a JSON object from LLM output, handling markdown fences and prose.
+
+    Attempts in order:
+    1. Direct parse of the full text
+    2. Extract from a markdown ```json ... ``` fence
+    3. Brace-counting extractor with multi-attempt JSON repair
+       (handles deeply nested objects, escaped quotes, and truncated JSON)
+    """
     text = text.strip()
+
+    # 1. Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from markdown code fences
+    # 2. Markdown code fence
     fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if fence_match:
         try:
@@ -29,15 +100,8 @@ def extract_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
 
-    # Try finding first { ... } block (greedy match for outermost braces)
-    brace_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return None
+    # 3. Brace-counting extractor (replaces fragile regex — handles nesting correctly)
+    return _extract_balanced_json(text)
 
 
 def run_agent_loop(
