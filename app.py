@@ -1,117 +1,144 @@
 import streamlit as st
-import time
-import random
+import logging
 from state import IncidentState
 from tools import log_search, runbook_lookup, metric_query, check_ssl
+from src.orchestrator import handle_incident
+from src.state_adapter import StateAdapter
+
+# Configure logging so agent activity shows in the terminal
+logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 
 # Page config
-st.set_page_config(page_title="Incident Response Orchestrator", layout="wide")
+st.set_page_config(page_title="HaMenate'ach — Incident Response", layout="wide")
 
-# Initialize session state for incident context and trace
-if "incident_state" not in st.session_state:
-    st.session_state.incident_state = IncidentState(incident_id=f"INC-{random.randint(1000, 9999)}")
-if "trace" not in st.session_state:
-    st.session_state.trace = []
+# Build the real tool registry from partner's tools.py
+TOOL_REGISTRY = {
+    "log_search": log_search,
+    "runbook_lookup": runbook_lookup,
+    "metric_query": metric_query,
+    "check_ssl": check_ssl,
+}
+
+# Initialize session state
+if "adapter" not in st.session_state:
+    st.session_state.adapter = StateAdapter(IncidentState)
+if "reports" not in st.session_state:
+    st.session_state.reports = []
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# --- Mock Orchestration Loop ---
-def mock_orchestration_loop(user_input: str):
-    """
-    Simulates the agent orchestration loop (Router -> Specialist -> Remediation).
-    This will be replaced by actual LLM logic later.
-    """
-    state = st.session_state.incident_state
-    
-    # 1. Router Agent Active
-    with st.status("🤖 Router Agent analyzing incident...", expanded=True) as status:
-        time.sleep(1)
-        st.write("Analyzing user report...")
-        state.add_timeline_event("Router", "Received incident report", tool_used=None)
-        st.session_state.trace.append({"agent": "Router", "action": "Classification", "detail": "Classified as Infrastructure/Database issue"})
-        status.update(label="Router Agent: Handoff to Database Specialist", state="complete")
 
-    # 2. Database Specialist Agent Active
-    with st.status("🔍 DB Specialist investigating...", expanded=True) as status:
-        time.sleep(1.5)
-        st.write("Searching logs for database errors...")
-        log_results = log_search("db-service")
-        state.add_finding("DB Specialist", "Found log entry: PostgreSQL connection pool exhausted")
-        state.add_timeline_event("DB Specialist", "Searched logs", tool_used="log_search")
-        st.session_state.trace.append({"agent": "DB Specialist", "action": "Log Search", "detail": "Found connection pool exhaustion in db-service"})
-        
-        st.write("Checking connection metrics...")
-        metric_results = metric_query("connections", "db-service")
-        state.add_finding("DB Specialist", "Current connections at 500/500 (100% usage)")
-        state.add_timeline_event("DB Specialist", "Queried metrics", tool_used="metric_query")
-        st.session_state.trace.append({"agent": "DB Specialist", "action": "Metric Query", "detail": "Connections at max capacity (500)"})
-        
-        state.update_severity("DB Specialist", "High")
-        status.update(label="DB Specialist: Investigation Complete", state="complete")
+def run_real_orchestration(user_input: str) -> dict:
+    """Run the actual LLM-powered multi-agent orchestration pipeline."""
+    report = handle_incident(
+        description=user_input,
+        state=st.session_state.adapter,
+        tool_registry=TOOL_REGISTRY,
+    )
+    st.session_state.reports.append(report)
+    return report
 
-    # 3. Remediation Agent Active
-    with st.status("🛠️ Remediation Agent active...", expanded=True) as status:
-        time.sleep(1)
-        st.write("Looking up remediation runbook...")
-        runbook = runbook_lookup("DB_CONN_EXHAUSTED")
-        state.add_finding("Remediation Agent", f"Following runbook: {runbook}")
-        state.add_timeline_event("Remediation Agent", "Found runbook", tool_used="runbook_lookup")
-        st.session_state.trace.append({"agent": "Remediation Agent", "action": "Runbook Lookup", "detail": "Retrieved DB_CONN_EXHAUSTED steps"})
-        
-        time.sleep(1)
-        st.write("Drafting remediation plan...")
-        status.update(label="Remediation Agent: Plan Ready", state="complete")
 
-    return "Investigation complete. I've identified a database connection pool exhaustion in the 'db-service'. Severity has been upgraded to High. Remediation steps involve increasing max_connections and checking for long-running queries."
+def format_report(report: dict) -> str:
+    """Format the orchestrator report into readable markdown."""
+    if report.get("incident_id") is None:
+        return report["synthesis"]["summary"]
+
+    routing = report["routing"]
+    lines = [
+        f"**Incident** `{report['incident_id']}` | **Severity: {report['overall_severity']}**",
+        f"**Routed to:** {routing['category']} (confidence: {routing['confidence']:.0%})",
+        "",
+    ]
+
+    if routing.get("ambiguous"):
+        lines.append("> Routing was ambiguous — confidence below 60%")
+        lines.append("")
+
+    # Agents dispatched
+    lines.append(f"**Agents dispatched:** {', '.join(report['agents_dispatched'])}")
+    lines.append("")
+
+    # Synthesis
+    synth = report.get("synthesis", {})
+    if synth.get("summary"):
+        lines.append(f"### Summary\n{synth['summary']}")
+    if synth.get("root_cause"):
+        lines.append(f"\n**Root cause:** {synth['root_cause']}")
+    if synth.get("causal_chain"):
+        lines.append(f"\n**Causal chain:** {synth['causal_chain']}")
+
+    # Remediation
+    steps = synth.get("remediation_steps", [])
+    if steps:
+        lines.append("\n### Remediation")
+        for i, step in enumerate(steps, 1):
+            lines.append(f"{i}. {step}")
+
+    # Prevention
+    prevention = synth.get("prevention", [])
+    if prevention:
+        lines.append("\n### Prevention")
+        for p in prevention:
+            lines.append(f"- {p}")
+
+    return "\n".join(lines)
+
 
 # --- Sidebar: Orchestration Trace ---
 with st.sidebar:
-    st.header("🕵️ Orchestration Trace")
+    st.header("Orchestration Trace")
     st.info("Real-time agent handoffs and tool executions")
-    
-    for entry in st.session_state.trace:
-        with st.expander(f"**{entry['agent']}** - {entry['action']}", expanded=False):
-            st.write(f"*Detail:* {entry['detail']}")
-    
-    if st.button("Reset State"):
-        st.session_state.incident_state = IncidentState(incident_id=f"INC-{random.randint(1000, 9999)}")
-        st.session_state.trace = []
+
+    for report in st.session_state.reports:
+        if report.get("timeline"):
+            iid = report.get("incident_id", "?")
+            with st.expander(f"**{iid}** — {report.get('overall_severity', '?')}", expanded=True):
+                for event in report["timeline"]:
+                    st.write(f"- {event}")
+
+    if st.button("Reset"):
+        st.session_state.adapter = StateAdapter(IncidentState)
+        st.session_state.reports = []
         st.session_state.messages = []
         st.rerun()
 
 # --- Main UI ---
-st.title("🛡️ Incident Response Orchestrator")
-st.caption(f"Connected to Shared Incident Context: **{st.session_state.incident_state.incident_id}**")
+st.title("HaMenate'ach — Incident Response Orchestrator")
+st.caption("Multi-agent SRE system with automatic cross-domain escalation")
 
-# Display Conversation
+# Display conversation
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# User Input
-if prompt := st.chat_input("Report an incident (e.g., 'The payment service is down')"):
-    # Add user message to chat
+# User input
+if prompt := st.chat_input("Report an incident (e.g., 'PostgreSQL connection pool exhausted')"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Run Mock Orchestration
     with st.chat_message("assistant"):
-        response = mock_orchestration_loop(prompt)
+        with st.spinner("Routing and dispatching agents..."):
+            report = run_real_orchestration(prompt)
+            response = format_report(report)
         st.markdown(response)
         st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Findings & Timeline Display (Bottom of Page)
-st.divider()
-col1, col2 = st.columns(2)
-
-with col1:
-    st.subheader("📋 Key Findings")
-    for finding in st.session_state.incident_state.findings:
-        st.success(finding)
-
-with col2:
-    st.subheader("⏳ Incident Timeline")
-    for event in reversed(st.session_state.incident_state.timeline):
-        st.write(f"**{event['timestamp']}** | **{event['agent']}**: {event['description']} " + 
-                 (f"*(Tool: `{event['tool']}`)*" if event['tool'] else ""))
+# Findings display
+if st.session_state.reports:
+    st.divider()
+    latest = st.session_state.reports[-1]
+    if latest.get("findings"):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Key Findings")
+            for finding in latest["findings"]:
+                agent = finding.get("agent", "unknown")
+                root = finding.get("root_cause", str(finding))
+                sev = finding.get("severity", "?")
+                st.success(f"**{agent}** [{sev}]: {root}")
+        with col2:
+            st.subheader("Timeline")
+            for event in latest.get("timeline", []):
+                st.write(f"- {event}")
