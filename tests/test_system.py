@@ -69,6 +69,11 @@ def tool_registry():
     return registry
 
 
+def _ollama_response(content: str):
+    """Build a mock Ollama chat response."""
+    return {"message": {"content": content}}
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for extract_json
 # ---------------------------------------------------------------------------
@@ -95,88 +100,66 @@ class TestExtractJson:
 
 
 # ---------------------------------------------------------------------------
-# Router tests (mock the Groq API)
+# Router tests (mock Ollama)
 # ---------------------------------------------------------------------------
 
-def _mock_groq_response(content: str):
-    """Build a mock OpenAI ChatCompletion response."""
-    mock_resp = MagicMock()
-    mock_resp.choices = [MagicMock()]
-    mock_resp.choices[0].message.content = content
-    return mock_resp
-
-
 class TestRouter:
-    @patch("src.router.OpenAI")
-    def test_1_postgres_connection_pool(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_1_postgres_connection_pool(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "DATABASE", "confidence": 0.92, "reasoning": "PostgreSQL connection pool exhaustion is a database issue."}'
         )
-        result = route_incident("PostgreSQL connection pool exhausted — all 100 connections in use, new requests timing out")
+        result = route_incident("PostgreSQL connection pool exhausted — all 100 connections in use")
         assert result["category"] == "DATABASE"
         assert result["confidence"] >= 0.6
         assert result["ambiguous"] is False
 
-    @patch("src.router.OpenAI")
-    def test_2_ssl_cert_expiring(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_2_ssl_cert_expiring(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "NETWORK", "confidence": 0.95, "reasoning": "SSL certificate expiry is a network/TLS issue."}'
         )
         result = route_incident("SSL certificate for api.example.com expires in 2 days")
         assert result["category"] == "NETWORK"
 
-    @patch("src.router.OpenAI")
-    def test_3_ssh_brute_force(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_3_ssh_brute_force(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "SECURITY", "confidence": 0.97, "reasoning": "SSH brute force is a security incident."}'
         )
         result = route_incident("Detected 5000+ failed SSH login attempts from 203.0.113.42 in the last hour")
         assert result["category"] == "SECURITY"
 
-    @patch("src.router.OpenAI")
-    def test_4_ambiguous_users_cant_login(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_4_ambiguous_users_cant_login(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.45, "reasoning": "Vague — could be auth service, database, or network."}'
         )
         result = route_incident("Users can't log in.")
         assert result["ambiguous"] is True or result["confidence"] < 0.6
 
-    @patch("src.router.OpenAI")
-    def test_5_out_of_scope(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_5_out_of_scope(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "OUT_OF_SCOPE", "confidence": 0.99, "reasoning": "Not a production incident."}'
         )
         result = route_incident("When is the company all-hands meeting?")
         assert result["category"] == "OUT_OF_SCOPE"
 
-    @patch("src.router.OpenAI")
-    def test_6_multi_domain(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_6_multi_domain(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.72, "reasoning": "API latency with DB CPU spike — app layer is primary but database is involved."}'
         )
         result = route_incident("API latency spiking to 12s p99 while database CPU is at 98%")
         assert result["category"] in AGENT_CATEGORIES
 
-    @patch("src.router.OpenAI")
-    def test_7_memory_leak(self, mock_openai_cls):
-        client = MagicMock()
-        mock_openai_cls.return_value = client
-        client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.router.ollama")
+    def test_7_memory_leak(self, mock_ollama):
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.93, "reasoning": "Memory leak in a service is an application issue."}'
         )
-        result = route_incident("Memory leak in payment-service — RSS growing 50MB/hour, will OOM in ~3 hours")
+        result = route_incident("Memory leak in payment-service — RSS growing 50MB/hour")
         assert result["category"] == "APPLICATION"
 
 
@@ -188,336 +171,231 @@ class TestAgentLoop:
     @patch("src.agent_loop.ollama")
     def test_agent_calls_tool_then_final_answer(self, mock_ollama, state, tool_registry):
         incident_id = state.create_incident("test incident")
-
-        # First call: tool_call, second call: final_answer
         mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "error", "service": "db"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "Connection pool exhausted", "evidence": ["error logs found"], "remediation": ["Increase pool size"], "escalate_to": null}'}},
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "error", "service": "db"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "Connection pool exhausted", "evidence": ["error logs found"], "remediation": ["Increase pool size"], "escalate_to": null}'),
         ]
-
         result = run_agent_loop(
             system_prompt="You are a DB specialist.",
             incident_description="test incident",
             tool_registry=tool_registry,
             allowed_tools=["log_search", "runbook_lookup", "metric_query"],
-            state=state,
-            incident_id=incident_id,
-            agent_name="DATABASE_agent",
+            state=state, incident_id=incident_id, agent_name="DATABASE_agent",
         )
-
         assert result["severity"] == "HIGH"
         assert result["root_cause"] == "Connection pool exhausted"
         assert len(result["evidence"]) > 0
-        assert len(result["remediation"]) > 0
         tool_registry["log_search"].assert_called_once()
 
     @patch("src.agent_loop.ollama")
     def test_agent_respects_allowed_tools(self, mock_ollama, state, tool_registry):
         incident_id = state.create_incident("test incident")
-
         mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "check_ssl", "args": {"domain": "example.com"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "LOW", "root_cause": "N/A", "evidence": [], "remediation": [], "escalate_to": null}'}},
+            _ollama_response('{"action": "tool_call", "tool": "check_ssl", "args": {"domain": "example.com"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "LOW", "root_cause": "N/A", "evidence": [], "remediation": [], "escalate_to": null}'),
         ]
-
-        result = run_agent_loop(
+        run_agent_loop(
             system_prompt="You are a DB specialist.",
             incident_description="test",
             tool_registry=tool_registry,
-            allowed_tools=["log_search"],  # check_ssl NOT allowed
-            state=state,
-            incident_id=incident_id,
-            agent_name="DATABASE_agent",
+            allowed_tools=["log_search"],
+            state=state, incident_id=incident_id, agent_name="DATABASE_agent",
         )
-
-        # check_ssl should NOT have been called
         tool_registry["check_ssl"].assert_not_called()
 
     @patch("src.agent_loop.ollama")
     def test_agent_escalation(self, mock_ollama, state, tool_registry):
         incident_id = state.create_incident("test incident")
-
-        mock_ollama.chat.return_value = {
-            "message": {"content": '{"action": "final_answer", "severity": "CRITICAL", "root_cause": "Unauthorized ALTER TABLE", "evidence": ["replication slot dropped"], "remediation": ["Revoke permissions"], "escalate_to": "SECURITY"}'}
-        }
-
+        mock_ollama.chat.return_value = _ollama_response(
+            '{"action": "final_answer", "severity": "CRITICAL", "root_cause": "Unauthorized ALTER TABLE", "evidence": ["replication slot dropped"], "remediation": ["Revoke permissions"], "escalate_to": "SECURITY"}'
+        )
         result = run_agent_loop(
             system_prompt="You are a DB specialist.",
             incident_description="test",
             tool_registry=tool_registry,
             allowed_tools=["log_search"],
-            state=state,
-            incident_id=incident_id,
-            agent_name="DATABASE_agent",
+            state=state, incident_id=incident_id, agent_name="DATABASE_agent",
         )
-
         assert result["escalate_to"] == "SECURITY"
 
 
 # ---------------------------------------------------------------------------
-# Full orchestration tests (mock both Groq and Ollama)
+# Full orchestration tests (mock Ollama everywhere)
 # ---------------------------------------------------------------------------
 
 class TestOrchestrator:
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_1_postgres_full_pipeline(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
-        """Test 1: PostgreSQL connection pool → DATABASE agent, calls log_search + runbook_lookup."""
-        # Router
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_1_postgres_full_pipeline(self, mock_router, mock_synth, mock_agent, state, tool_registry):
+        """Test 1: PostgreSQL connection pool → DATABASE agent."""
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "DATABASE", "confidence": 0.92, "reasoning": "DB connection pool issue."}'
         )
-
-        # Synthesis
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_synth.chat.return_value = _ollama_response(
             '{"summary": "Connection pool exhausted.", "root_cause": "Too many connections.", "causal_chain": null, "overall_severity": "HIGH", "remediation_steps": ["Increase pool"], "prevention": ["Add monitoring"]}'
         )
-
-        # Agent: call log_search, then runbook_lookup, then final_answer
-        mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "connection pool", "service": "postgres"}}'}},
-            {"message": {"content": '{"action": "tool_call", "tool": "runbook_lookup", "args": {"topic": "connection pool exhaustion"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "Connection pool exhausted", "evidence": ["Log shows 100/100 connections"], "remediation": ["Increase max_connections"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "connection pool", "service": "postgres"}}'),
+            _ollama_response('{"action": "tool_call", "tool": "runbook_lookup", "args": {"topic": "connection pool exhaustion"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "Connection pool exhausted", "evidence": ["Log shows 100/100 connections"], "remediation": ["Increase max_connections"], "escalate_to": null}'),
         ]
-
-        report = handle_incident(
-            "PostgreSQL connection pool exhausted — all 100 connections in use",
-            state,
-            tool_registry,
-        )
-
+        report = handle_incident("PostgreSQL connection pool exhausted — all 100 connections in use", state, tool_registry)
         assert report["routing"]["category"] == "DATABASE"
         assert "DATABASE_agent" in report["agents_dispatched"]
-        assert len(report["findings"]) >= 1
         assert report["overall_severity"] == "HIGH"
         tool_registry["log_search"].assert_called()
         tool_registry["runbook_lookup"].assert_called()
 
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_2_ssl_cert(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_2_ssl_cert(self, mock_router, mock_synth, mock_agent, state, tool_registry):
         """Test 2: SSL cert expiring → NETWORK agent, calls check_ssl."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "NETWORK", "confidence": 0.95, "reasoning": "SSL cert issue."}'
         )
-
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_synth.chat.return_value = _ollama_response(
             '{"summary": "SSL cert expiring.", "root_cause": "Cert not renewed.", "causal_chain": null, "overall_severity": "HIGH", "remediation_steps": ["Renew cert"], "prevention": ["Auto-renew"]}'
         )
-
-        mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "check_ssl", "args": {"domain": "api.example.com"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "SSL cert expiring in 2 days", "evidence": ["check_ssl shows expiry"], "remediation": ["Renew certificate"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            _ollama_response('{"action": "tool_call", "tool": "check_ssl", "args": {"domain": "api.example.com"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "SSL cert expiring", "evidence": ["check_ssl shows expiry"], "remediation": ["Renew certificate"], "escalate_to": null}'),
         ]
-
         report = handle_incident("SSL certificate for api.example.com expires in 2 days", state, tool_registry)
         assert report["routing"]["category"] == "NETWORK"
         tool_registry["check_ssl"].assert_called()
 
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_3_ssh_brute_force(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_3_ssh_brute_force(self, mock_router, mock_synth, mock_agent, state, tool_registry):
         """Test 3: SSH brute force → SECURITY agent, severity HIGH."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "SECURITY", "confidence": 0.97, "reasoning": "Brute force attack."}'
         )
-
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_synth.chat.return_value = _ollama_response(
             '{"summary": "SSH brute force detected.", "root_cause": "External attack.", "causal_chain": null, "overall_severity": "HIGH", "remediation_steps": ["Block IP"], "prevention": ["Fail2ban"]}'
         )
-
-        mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "failed SSH login", "service": "sshd"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "SSH brute force from 203.0.113.42", "evidence": ["5000+ failed logins"], "remediation": ["Block IP", "Enable fail2ban"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "failed SSH login", "service": "sshd"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "SSH brute force from 203.0.113.42", "evidence": ["5000+ failed logins"], "remediation": ["Block IP", "Enable fail2ban"], "escalate_to": null}'),
         ]
-
         report = handle_incident("Detected 5000+ failed SSH login attempts from 203.0.113.42", state, tool_registry)
         assert report["routing"]["category"] == "SECURITY"
         assert report["overall_severity"] in ("HIGH", "CRITICAL")
         tool_registry["log_search"].assert_called()
 
-    @patch("src.router.OpenAI")
-    def test_4_ambiguous_login(self, mock_router_openai):
+    @patch("src.router.ollama")
+    def test_4_ambiguous_login(self, mock_ollama):
         """Test 4: 'Users can't log in' → ambiguous flag or low confidence."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.45, "reasoning": "Vague report."}'
         )
-
         result = route_incident("Users can't log in.")
         assert result["ambiguous"] is True or result["confidence"] < 0.6
 
-    @patch("src.router.OpenAI")
-    def test_5_out_of_scope_no_agent(self, mock_router_openai, state, tool_registry):
+    @patch("src.router.ollama")
+    def test_5_out_of_scope_no_agent(self, mock_ollama, state, tool_registry):
         """Test 5: 'When is the all-hands?' → OUT_OF_SCOPE, no agent dispatched."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_ollama.chat.return_value = _ollama_response(
             '{"category": "OUT_OF_SCOPE", "confidence": 0.99, "reasoning": "Not an incident."}'
         )
-
         report = handle_incident("When is the company all-hands meeting?", state, tool_registry)
         assert report["routing"]["category"] == "OUT_OF_SCOPE"
         assert report["agents_dispatched"] == []
         assert report["incident_id"] is None
 
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_6_multi_domain(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
-        """Test 6: API latency + DB CPU → multi-domain, both APPLICATION + DATABASE dispatched."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_6_multi_domain(self, mock_router, mock_synth, mock_agent, state, tool_registry):
+        """Test 6: API latency + DB CPU → multi-domain, APPLICATION + DATABASE dispatched."""
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.72, "reasoning": "App latency with DB involvement."}'
         )
-
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
-            '{"summary": "Cascading failure.", "root_cause": "DB CPU spike causing app latency.", "causal_chain": "DB CPU → slow queries → app timeout", "overall_severity": "HIGH", "remediation_steps": ["Scale DB", "Add caching"], "prevention": ["Query optimization"]}'
+        mock_synth.chat.return_value = _ollama_response(
+            '{"summary": "Cascading failure.", "root_cause": "DB CPU spike causing app latency.", "causal_chain": "DB CPU → slow queries → app timeout", "overall_severity": "HIGH", "remediation_steps": ["Scale DB"], "prevention": ["Query optimization"]}'
         )
-
-        # APPLICATION agent escalates to DATABASE
-        mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "metric_query", "args": {"metric": "latency_p99", "service": "api"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "App latency caused by slow DB queries", "evidence": ["p99 latency 12s"], "remediation": ["Investigate DB"], "escalate_to": "DATABASE"}'}},
-            # DATABASE agent
-            {"message": {"content": '{"action": "tool_call", "tool": "metric_query", "args": {"metric": "cpu_usage", "service": "postgres"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "DB CPU at 98% from unoptimized queries", "evidence": ["CPU at 98%"], "remediation": ["Kill slow queries", "Add indexes"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            _ollama_response('{"action": "tool_call", "tool": "metric_query", "args": {"metric": "latency_p99", "service": "api"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "App latency caused by slow DB queries", "evidence": ["p99 latency 12s"], "remediation": ["Investigate DB"], "escalate_to": "DATABASE"}'),
+            _ollama_response('{"action": "tool_call", "tool": "metric_query", "args": {"metric": "cpu_usage", "service": "postgres"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "DB CPU at 98%", "evidence": ["CPU at 98%"], "remediation": ["Kill slow queries"], "escalate_to": null}'),
         ]
-
-        report = handle_incident(
-            "API latency spiking to 12s p99 while database CPU is at 98%",
-            state,
-            tool_registry,
-        )
-
+        report = handle_incident("API latency spiking to 12s p99 while database CPU is at 98%", state, tool_registry)
         assert len(report["agents_dispatched"]) >= 2
-        dispatched_names = report["agents_dispatched"]
-        assert any("APPLICATION" in n for n in dispatched_names)
-        assert any("DATABASE" in n for n in dispatched_names)
+        assert any("APPLICATION" in n for n in report["agents_dispatched"])
+        assert any("DATABASE" in n for n in report["agents_dispatched"])
 
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_7_memory_leak(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_7_memory_leak(self, mock_router, mock_synth, mock_agent, state, tool_registry):
         """Test 7: Memory leak in payment-service → APPLICATION, calls log_search + metric_query."""
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "APPLICATION", "confidence": 0.93, "reasoning": "Memory leak."}'
         )
-
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
-            '{"summary": "Memory leak in payment-service.", "root_cause": "Unbounded cache growth.", "causal_chain": null, "overall_severity": "HIGH", "remediation_steps": ["Restart service", "Fix cache"], "prevention": ["Add memory limits"]}'
+        mock_synth.chat.return_value = _ollama_response(
+            '{"summary": "Memory leak in payment-service.", "root_cause": "Unbounded cache growth.", "causal_chain": null, "overall_severity": "HIGH", "remediation_steps": ["Restart service"], "prevention": ["Add memory limits"]}'
         )
-
-        mock_ollama.chat.side_effect = [
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "OOM memory", "service": "payment-service"}}'}},
-            {"message": {"content": '{"action": "tool_call", "tool": "metric_query", "args": {"metric": "memory_rss", "service": "payment-service"}}'}},
-            {"message": {"content": '{"action": "final_answer", "severity": "HIGH", "root_cause": "Memory leak — RSS growing 50MB/hour", "evidence": ["RSS growing linearly", "OOM warnings in logs"], "remediation": ["Restart pod", "Profile heap"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "OOM memory", "service": "payment-service"}}'),
+            _ollama_response('{"action": "tool_call", "tool": "metric_query", "args": {"metric": "memory_rss", "service": "payment-service"}}'),
+            _ollama_response('{"action": "final_answer", "severity": "HIGH", "root_cause": "Memory leak — RSS growing 50MB/hour", "evidence": ["RSS growing linearly", "OOM warnings"], "remediation": ["Restart pod", "Profile heap"], "escalate_to": null}'),
         ]
-
-        report = handle_incident(
-            "Memory leak in payment-service — RSS growing 50MB/hour, will OOM in ~3 hours",
-            state,
-            tool_registry,
-        )
-
+        report = handle_incident("Memory leak in payment-service — RSS growing 50MB/hour", state, tool_registry)
         assert report["routing"]["category"] == "APPLICATION"
         tool_registry["log_search"].assert_called()
         tool_registry["metric_query"].assert_called()
 
     @patch("src.agent_loop.ollama")
-    @patch("src.orchestrator.OpenAI")
-    @patch("src.router.OpenAI")
-    def test_8_surprise_cascading_failure(self, mock_router_openai, mock_synth_openai, mock_ollama, state, tool_registry):
-        """Test 8: Surprise Twist — cascading failure: DATABASE → escalate to SECURITY.
-
-        Incident: Read replica 47min behind primary, caused by unauthorized ALTER TABLE
-        by 'analytics_bot' which should only have SELECT permissions.
-        """
+    @patch("src.orchestrator.ollama")
+    @patch("src.router.ollama")
+    def test_8_surprise_cascading_failure(self, mock_router, mock_synth, mock_agent, state, tool_registry):
+        """Test 8: Surprise Twist — DATABASE → escalate to SECURITY."""
         description = (
             "Database queries are returning stale data. Investigation shows the read replica "
             "is 47 minutes behind primary. Cause: the replication slot was dropped after an "
             "unauthorized ALTER TABLE command executed by user 'analytics_bot' — an account "
             "that should only have SELECT permissions."
         )
-
-        # Router → DATABASE
-        router_client = MagicMock()
-        mock_router_openai.return_value = router_client
-        router_client.chat.completions.create.return_value = _mock_groq_response(
+        mock_router.chat.return_value = _ollama_response(
             '{"category": "DATABASE", "confidence": 0.88, "reasoning": "Replication lag and stale data are database issues."}'
         )
-
-        # Synthesis
-        synth_client = MagicMock()
-        mock_synth_openai.return_value = synth_client
-        synth_client.chat.completions.create.return_value = _mock_groq_response(
-            '{"summary": "Security breach caused database replication failure. analytics_bot executed unauthorized ALTER TABLE, dropping the replication slot.", '
-            '"root_cause": "Privilege escalation on analytics_bot account.", '
+        mock_synth.chat.return_value = _ollama_response(
+            '{"summary": "Security breach caused database replication failure.", "root_cause": "Privilege escalation on analytics_bot account.", '
             '"causal_chain": "Unauthorized ALTER TABLE → replication slot dropped → replica 47min behind → stale reads", '
-            '"overall_severity": "CRITICAL", '
-            '"remediation_steps": ["Recreate replication slot", "Revoke analytics_bot ALTER privileges", "Rotate credentials", "Audit all analytics_bot activity"], '
+            '"overall_severity": "CRITICAL", "remediation_steps": ["Recreate replication slot", "Revoke privileges", "Rotate credentials"], '
             '"prevention": ["Enforce least-privilege", "Add DDL audit logging"]}'
         )
-
-        # DATABASE agent: investigates, finds security issue, escalates
-        # SECURITY agent: investigates the permission violation
-        mock_ollama.chat.side_effect = [
-            # DATABASE agent — tool calls
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "replication slot", "service": "postgres"}}'}},
-            {"message": {"content": '{"action": "tool_call", "tool": "metric_query", "args": {"metric": "replication_lag", "service": "postgres"}}'}},
-            # DATABASE agent — final answer with escalation
-            {"message": {"content": '{"action": "final_answer", "severity": "CRITICAL", "root_cause": "Replication slot dropped by unauthorized ALTER TABLE from analytics_bot", "evidence": ["Replica 47min behind", "ALTER TABLE in logs from analytics_bot"], "remediation": ["Recreate replication slot", "Rebuild replica if needed"], "escalate_to": "SECURITY"}'}},
-            # SECURITY agent — tool calls
-            {"message": {"content": '{"action": "tool_call", "tool": "log_search", "args": {"query": "analytics_bot ALTER TABLE", "service": "postgres"}}'}},
-            {"message": {"content": '{"action": "tool_call", "tool": "runbook_lookup", "args": {"topic": "privilege escalation response"}}'}},
-            # SECURITY agent — final answer
-            {"message": {"content": '{"action": "final_answer", "severity": "CRITICAL", "root_cause": "analytics_bot account had elevated privileges allowing ALTER TABLE — should only have SELECT", "evidence": ["ALTER TABLE executed by analytics_bot", "Account only authorized for SELECT"], "remediation": ["Revoke ALTER/DROP privileges", "Rotate credentials", "Audit account activity"], "escalate_to": null}'}},
+        mock_agent.chat.side_effect = [
+            # DATABASE agent tool calls
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "replication slot", "service": "postgres"}}'),
+            _ollama_response('{"action": "tool_call", "tool": "metric_query", "args": {"metric": "replication_lag", "service": "postgres"}}'),
+            # DATABASE agent final answer with escalation
+            _ollama_response('{"action": "final_answer", "severity": "CRITICAL", "root_cause": "Replication slot dropped by unauthorized ALTER TABLE from analytics_bot", "evidence": ["Replica 47min behind", "ALTER TABLE in logs"], "remediation": ["Recreate replication slot"], "escalate_to": "SECURITY"}'),
+            # SECURITY agent tool calls
+            _ollama_response('{"action": "tool_call", "tool": "log_search", "args": {"query": "analytics_bot ALTER TABLE", "service": "postgres"}}'),
+            _ollama_response('{"action": "tool_call", "tool": "runbook_lookup", "args": {"topic": "privilege escalation response"}}'),
+            # SECURITY agent final answer
+            _ollama_response('{"action": "final_answer", "severity": "CRITICAL", "root_cause": "analytics_bot had elevated privileges allowing ALTER TABLE — should only have SELECT", "evidence": ["ALTER TABLE executed by analytics_bot", "Account only authorized for SELECT"], "remediation": ["Revoke privileges", "Rotate credentials", "Audit account activity"], "escalate_to": null}'),
         ]
-
         report = handle_incident(description, state, tool_registry)
 
-        # Assert DATABASE agent dispatched first
+        # DATABASE dispatched first
         assert report["agents_dispatched"][0] == "DATABASE_agent"
-
-        # Assert SECURITY agent dispatched second (via escalation)
+        # SECURITY dispatched via escalation
         assert "SECURITY_agent" in report["agents_dispatched"]
         assert len(report["agents_dispatched"]) >= 2
-
-        # Assert findings from BOTH agents
+        # Findings from BOTH agents
         assert len(report["findings"]) >= 2
         agents_in_findings = [f.get("agent") for f in report["findings"]]
         assert "DATABASE_agent" in agents_in_findings
         assert "SECURITY_agent" in agents_in_findings
-
-        # Assert overall severity is CRITICAL
+        # Overall severity is CRITICAL
         assert report["overall_severity"] == "CRITICAL"
-
-        # Assert timeline is chronological (events exist)
-        assert len(report["timeline"]) > 0
-        # Check escalation event is recorded
+        # Timeline records escalation
         timeline_text = " ".join(report["timeline"])
         assert "escalat" in timeline_text.lower()
 

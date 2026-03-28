@@ -1,7 +1,4 @@
-"""Shared configuration — API keys, model names, constants."""
-
-import os
-
+"""Shared configuration — model names, constants. All LLM calls use local Ollama."""
 
 OLLAMA_MODEL = "qwen2.5:14b"
 OLLAMA_BASE_URL = "http://localhost:11434"
