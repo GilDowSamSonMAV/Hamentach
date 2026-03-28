@@ -1,11 +1,11 @@
-"""Incident classifier — uses Groq for fast inference to route incidents to specialists."""
+"""Incident classifier — uses local Ollama for routing incidents to specialists."""
 
-import json
 import logging
 
-from openai import OpenAI
+import ollama
 
-from .config import GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL, AGENT_CATEGORIES
+from .config import OLLAMA_MODEL, AGENT_CATEGORIES
+from .agent_loop import extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -31,30 +31,29 @@ Rules:
 
 
 def route_incident(description: str) -> dict:
-    """Classify an incident description into a category using Groq LLM.
+    """Classify an incident description into a category using local Ollama.
 
     Returns:
         dict with keys: category, confidence, reasoning, ambiguous (bool)
     """
-    client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
-
     logger.info(f"Routing incident: {description[:100]}...")
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
         messages=[
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
             {"role": "user", "content": description},
         ],
-        temperature=0.1,
-        max_tokens=256,
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = response["message"]["content"].strip()
     logger.debug(f"Router raw response: {raw}")
 
-    # Parse JSON robustly
-    parsed = _parse_router_response(raw)
+    # Parse JSON robustly (reuse extract_json from agent_loop)
+    parsed = extract_json(raw)
+    if parsed is None:
+        logger.error(f"Could not parse router response: {raw}")
+        parsed = {"category": "OUT_OF_SCOPE", "confidence": 0.0, "reasoning": "Failed to parse LLM output"}
 
     # Validate and normalise
     category = parsed.get("category", "OUT_OF_SCOPE").upper()
@@ -77,34 +76,3 @@ def route_incident(description: str) -> dict:
 
     logger.info(f"Routing result: {category} (confidence={confidence:.2f}, ambiguous={ambiguous})")
     return result
-
-
-def _parse_router_response(raw: str) -> dict:
-    """Parse the router LLM response, handling markdown fences and malformed output."""
-    import re
-
-    raw = raw.strip()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # Try markdown fence
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    # Try first JSON object
-    brace_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    logger.error(f"Could not parse router response: {raw}")
-    return {"category": "OUT_OF_SCOPE", "confidence": 0.0, "reasoning": "Failed to parse LLM output"}

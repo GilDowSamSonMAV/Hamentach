@@ -4,12 +4,12 @@ import json
 import logging
 from typing import Any, Callable
 
-from openai import OpenAI
+import ollama
 
-from .config import GROQ_API_KEY, GROQ_BASE_URL, GROQ_MODEL
+from .config import OLLAMA_MODEL
 from .router import route_incident
 from .agents import AGENTS
-from .agent_loop import run_agent_loop
+from .agent_loop import run_agent_loop, extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -173,51 +173,29 @@ def _synthesize_report(
     findings: list[dict],
     agents_dispatched: list[str],
 ) -> dict:
-    """Use Groq to synthesize a unified report from all agent findings."""
-    client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
-
+    """Use local Ollama to synthesize a unified report from all agent findings."""
     user_content = (
         f"Incident description:\n{description}\n\n"
         f"Agents dispatched: {', '.join(agents_dispatched)}\n\n"
         f"Agent findings:\n{json.dumps(findings, indent=2, default=str)}"
     )
 
-    logger.info("Synthesizing final report via Groq")
+    logger.info("Synthesizing final report via Ollama")
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
         messages=[
             {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
-        temperature=0.2,
-        max_tokens=1024,
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = response["message"]["content"].strip()
     logger.debug(f"Synthesis raw response: {raw}")
 
-    # Parse robustly
-    import re
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", raw, re.DOTALL)
-    if fence_match:
-        try:
-            return json.loads(fence_match.group(1).strip())
-        except json.JSONDecodeError:
-            pass
-
-    brace_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group(0))
-        except json.JSONDecodeError:
-            pass
+    parsed = extract_json(raw)
+    if parsed:
+        return parsed
 
     logger.error(f"Could not parse synthesis response: {raw}")
     return {
